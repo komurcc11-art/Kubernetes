@@ -1,0 +1,190 @@
+---
+- name: Configure Kubernetes node and join cluster
+  hosts: kubernetes_nodes
+  become: yes
+  vars:
+    controller_ip: "10.15.76.152"
+    join_token: "ajngo8.b4xw912zese7zl55"
+    discovery_hash: "sha256:e6a14268f342d2912f6254c4bda8ba9849ec4106676d22d3733134efc2b4399f"
+    k8s_version: "v1.32"
+
+  tasks:
+    - name: Check if br_netfilter module is loaded
+      shell: lsmod | grep br_netfilter
+      register: br_netfilter_loaded
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Load br_netfilter module if not loaded
+      modprobe:
+        name: br_netfilter
+        state: present
+      when: br_netfilter_loaded.rc != 0
+
+    - name: Create Kubernetes modules load configuration
+      copy:
+        content: "br_netfilter"
+        dest: /etc/modules-load.d/k8s.conf
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Create Kubernetes sysctl configuration
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+        dest: /etc/sysctl.d/k8s.conf
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Apply sysctl configuration
+      command: sysctl --system
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        force_apt_get: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - jq
+          - gnupg
+        state: present
+
+    - name: Download and add Kubernetes GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Download and add Docker GPG key for containerd
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/docker-archive-keyring.gpg
+
+    - name: Add containerd repository
+      copy:
+        content: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu jammy stable"
+        dest: /etc/apt/sources.list.d/containerd.list
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Update package cache after adding repositories
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes components and containerd
+      apt:
+        name:
+          - containerd.io
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages at current versions
+      shell: |
+        apt-mark hold kubelet kubeadm kubectl
+      args:
+        creates: /var/lib/apt/marks/kubelet
+
+    - name: Copy containerd configuration
+      copy:
+        src: "{{ playbook_dir }}/config/containerd_config.toml"
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: 0644
+      when: "'containerd_config.toml' in lookup('fileglob', playbook_dir + '/config/containerd_config.toml')"
+
+    - name: Create containerd modules configuration
+      copy:
+        content: |
+          overlay
+          br_netfilter
+          kvm-intel
+        dest: /etc/modules-load.d/containerd.conf
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Load overlay module
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter module for containerd
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Create Kubernetes CRI sysctl configuration
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Apply sysctl configuration for CRI
+      command: sysctl --system
+
+    - name: Restart containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd to be ready
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+
+          # - name: Clean up any existing kubelet configuration (if join failed previously)
+          #   file:
+          #     path: "{{ item }}"
+          #     state: absent
+          #   loop:
+          #     - /etc/kubernetes/kubelet.conf
+          #     - /etc/kubernetes/pki/ca.crt
+          #   ignore_errors: yes
+
+    - name: Join Kubernetes cluster
+      command: "kubeadm join {{ controller_ip }}:6443 --token {{ join_token }} --discovery-token-ca-cert-hash {{ discovery_hash }}"
+      register: join_result
+      failed_when: 
+        - join_result.rc != 0
+        - "'Node is already joined' not in join_result.stderr"
+      changed_when: join_result.rc == 0
+
+    - name: Display join result
+      debug:
+        var: join_result.stdout
